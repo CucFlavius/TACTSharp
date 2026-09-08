@@ -12,8 +12,11 @@ namespace TACTSharp
         private List<string> CDNServers = [];
         private readonly ConcurrentDictionary<string, Lock> FileLocks = [];
         private readonly Lock cdnLock = new();
-        public bool HasLocal = false;
-        private readonly Dictionary<byte, CASCIndexInstance> CASCIndexInstances = [];
+        private bool HasLocal = false;
+
+        public bool IsLocal => Volatile.Read(ref HasLocal);
+        private readonly Lock localIndexLock = new();
+        private Dictionary<byte, CASCIndexInstance> CASCIndexInstances = [];
         private Settings Settings;
 
         // TODO: The implementation around this needs improving. For local installations, this comes from .build.info. For remote this is set by the first CDN server it retrieves.
@@ -40,14 +43,15 @@ namespace TACTSharp
             if (string.IsNullOrEmpty(Settings.BaseDir))
                 return;
 
-            if (CASCIndexInstances.Count > 0)
+            if (Volatile.Read(ref HasLocal))
                 return;
 
             try
             {
                 var localTimer = new Stopwatch();
                 localTimer.Start();
-                LoadCASCIndices();
+                lock (localIndexLock)
+                    LoadCASCIndices();
                 localTimer.Stop();
                 if (Settings.LogLevel <= TSLogLevel.Info)
                     Console.WriteLine("Loaded local CASC indices in " + Math.Round(localTimer.Elapsed.TotalMilliseconds) + "ms");
@@ -131,6 +135,8 @@ namespace TACTSharp
                     if (CASCIndexInstances.Count > 0)
                         return;
 
+                    var instances = new Dictionary<byte, CASCIndexInstance>(16);
+
                     var indexFiles = Directory.GetFiles(dataDir, "*.idx");
                     var highestIndexPerBucket = new Dictionary<byte, int>(16);
 
@@ -156,17 +162,18 @@ namespace TACTSharp
                     foreach (var index in highestIndexPerBucket)
                     {
                         var indexFile = Path.Combine(dataDir, index.Key.ToString("x2") + index.Value.ToString("x2").PadLeft(8, '0') + ".idx");
-                        CASCIndexInstances.Add(index.Key, new CASCIndexInstance(indexFile));
+                        instances.Add(index.Key, new CASCIndexInstance(indexFile));
                     }
 
-                    HasLocal = true;
+                    CASCIndexInstances = instances;
+                    Volatile.Write(ref HasLocal, true);
                 }
             }
         }
 
         private byte[] DownloadFile(string type, string hash, ulong size = 0, CancellationToken token = new())
         {
-            if (HasLocal)
+            if (Volatile.Read(ref HasLocal))
             {
                 try
                 {
@@ -332,7 +339,13 @@ namespace TACTSharp
             var i = eKeyBytes[0] ^ eKeyBytes[1] ^ eKeyBytes[2] ^ eKeyBytes[3] ^ eKeyBytes[4] ^ eKeyBytes[5] ^ eKeyBytes[6] ^ eKeyBytes[7] ^ eKeyBytes[8];
             var indexBucket = (i & 0xf) ^ (i >> 4);
 
-            var targetIndex = CASCIndexInstances[(byte)indexBucket];
+            var indices = CASCIndexInstances;
+            if (!indices.TryGetValue((byte)indexBucket, out var targetIndex))
+            {
+                data = null;
+                return false;
+            }
+
             var (archiveOffset, archiveSize, archiveIndex) = targetIndex.GetIndexInfo(Convert.FromHexString(eKey));
             if (archiveOffset != -1)
             {
@@ -388,7 +401,7 @@ namespace TACTSharp
 
         private byte[] DownloadFileFromArchive(string eKey, string archive, int offset, int size, CancellationToken token = new())
         {
-            if (HasLocal)
+            if (Volatile.Read(ref HasLocal))
             {
                 try
                 {
