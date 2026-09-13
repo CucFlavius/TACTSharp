@@ -20,6 +20,10 @@
         public List<string> BlockedCDNs = [];
         public static TSLogLevel LogLevel = TSLogLevel.Info;
         public bool ForceHTTP1 = false;
+        // Optional host admission scope, invoked only for actual HTTP reads.
+        // Local CASC, CDN-folder and cache hits bypass it. Dispose after the
+        // response body has been consumed, including failed attempts.
+        public Func<CancellationToken, IDisposable>? NetworkRequestScope;
         public VersionService versionService = VersionService.Ribbit;
     }
 

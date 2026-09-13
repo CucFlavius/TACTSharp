@@ -8,7 +8,7 @@ namespace TACTSharp
 {
     public class CDN
     {
-        private readonly HttpClient Client = new();
+        private readonly HttpClient Client;
         private List<string> CDNServers = [];
         private readonly ConcurrentDictionary<string, Lock> FileLocks = [];
         private readonly Lock cdnLock = new();
@@ -28,8 +28,12 @@ namespace TACTSharp
         private IVersionService? versionService;
 
         // TODO: Memory mapped cache file access?
-        public CDN(Settings settings)
+        public CDN(Settings settings) : this(settings, new HttpClient()) { }
+
+        // The supplied client remains owned by the host.
+        public CDN(Settings settings, HttpClient client)
         {
+            Client = client;
             Settings = settings;
 
             if (settings.versionService == VersionService.Ribbit)
@@ -213,13 +217,15 @@ namespace TACTSharp
             var cachePath = Path.Combine(Settings.CacheDir, ProductDirectory, type, hash);
             FileLocks.TryAdd(cachePath, new Lock());
 
-            if (File.Exists(cachePath))
+            lock (FileLocks[cachePath])
             {
-                if (size > 0 && (ulong)new FileInfo(cachePath).Length != size)
-                    File.Delete(cachePath);
-                else
-                    lock (FileLocks[cachePath])
+                if (File.Exists(cachePath))
+                {
+                    if (size > 0 && (ulong)new FileInfo(cachePath).Length != size)
+                        File.Delete(cachePath);
+                    else
                         return File.ReadAllBytes(cachePath);
+                }
             }
 
             if (!string.IsNullOrEmpty(Settings.CDNDir))
@@ -272,17 +278,21 @@ namespace TACTSharp
                 if (Settings.LogLevel <= TSLogLevel.Info)
                     Console.WriteLine("Downloading " + url);
 
-                var request = new HttpRequestMessage(HttpMethod.Get, url);
+                using var request = new HttpRequestMessage(HttpMethod.Get, url);
                 if (Settings.ForceHTTP1)
                     request.Version = new Version(1, 1);
 
                 lock (FileLocks[cachePath])
                 {
+                    // Another caller may have completed while this one waited.
+                    if (File.Exists(cachePath) && (size == 0 || (ulong)new FileInfo(cachePath).Length == size))
+                        return File.ReadAllBytes(cachePath);
                     Directory.CreateDirectory(Path.GetDirectoryName(cachePath)!);
 
                     try
                     {
-                        var response = Client.Send(request, token);
+                        using var networkScope = Settings.NetworkRequestScope?.Invoke(token);
+                        using var response = Client.Send(request, token);
 
                         if (!response.IsSuccessStatusCode)
                         {
@@ -314,6 +324,11 @@ namespace TACTSharp
                                 }
                             }
                         }
+                    }
+                    catch (OperationCanceledException) when (token.IsCancellationRequested)
+                    {
+                        File.Delete(cachePath);
+                        throw;
                     }
                     catch (Exception e)
                     {
@@ -418,13 +433,15 @@ namespace TACTSharp
             var cachePath = Path.Combine(Settings.CacheDir, ProductDirectory, "data", eKey);
             FileLocks.TryAdd(cachePath, new Lock());
 
-            if (File.Exists(cachePath))
+            lock (FileLocks[cachePath])
             {
-                if (new FileInfo(cachePath).Length == size)
-                    lock (FileLocks[cachePath])
+                if (File.Exists(cachePath))
+                {
+                    if (new FileInfo(cachePath).Length == size)
                         return File.ReadAllBytes(cachePath);
-                else
-                    File.Delete(cachePath);
+                    else
+                        File.Delete(cachePath);
+                }
             }
 
             if (!string.IsNullOrEmpty(Settings.CDNDir))
@@ -493,7 +510,7 @@ namespace TACTSharp
                 if (Settings.LogLevel <= TSLogLevel.Info)
                     Console.WriteLine("Downloading file " + eKey + " from archive " + archive + " at offset " + offset + " with size " + size + " from " + CDNServers[i]);
 
-                var request = new HttpRequestMessage(HttpMethod.Get, url)
+                using var request = new HttpRequestMessage(HttpMethod.Get, url)
                 {
                     Headers =
                     {
@@ -504,19 +521,24 @@ namespace TACTSharp
                 if (Settings.ForceHTTP1)
                     request.Version = new Version(1, 1);
 
-                try
+                // Always acquire the file lock before network admission, as
+                // loose-file downloads do, to avoid a lock/queue inversion.
+                lock (FileLocks[cachePath])
                 {
-                    var response = Client.Send(request, token);
-
-                    if (!response.IsSuccessStatusCode)
+                    if (File.Exists(cachePath) && new FileInfo(cachePath).Length == size)
+                        return File.ReadAllBytes(cachePath);
+                    try
                     {
-                        if (Settings.LogLevel <= TSLogLevel.Warn)
-                            Console.WriteLine("Encountered HTTP " + response.StatusCode + " downloading " + eKey + " (archive " + archive + ") from " + CDNServers[i]);
-                        continue;
-                    }
+                        using var networkScope = Settings.NetworkRequestScope?.Invoke(token);
+                        using var response = Client.Send(request, token);
 
-                    lock (FileLocks[cachePath])
-                    {
+                        if (!response.IsSuccessStatusCode)
+                        {
+                            if (Settings.LogLevel <= TSLogLevel.Warn)
+                                Console.WriteLine("Encountered HTTP " + response.StatusCode + " downloading " + eKey + " (archive " + archive + ") from " + CDNServers[i]);
+                            continue;
+                        }
+
                         Directory.CreateDirectory(Path.GetDirectoryName(cachePath)!);
 
                         try
@@ -545,6 +567,11 @@ namespace TACTSharp
                                 }
                             }
                         }
+                        catch (OperationCanceledException) when (token.IsCancellationRequested)
+                        {
+                            File.Delete(cachePath);
+                            throw;
+                        }
                         catch (Exception ex)
                         {
                             if (Settings.LogLevel <= TSLogLevel.Warn)
@@ -553,12 +580,16 @@ namespace TACTSharp
                             continue;
                         }
                     }
-                }
-                catch (Exception e)
-                {
-                    if (Settings.LogLevel <= TSLogLevel.Warn)
-                        Console.WriteLine("Encountered exception " + e.Message + " downloading " + eKey + " (archive " + archive + ") from " + CDNServers[i]);
-                    continue;
+                    catch (OperationCanceledException) when (token.IsCancellationRequested)
+                    {
+                        throw;
+                    }
+                    catch (Exception e)
+                    {
+                        if (Settings.LogLevel <= TSLogLevel.Warn)
+                            Console.WriteLine("Encountered exception " + e.Message + " downloading " + eKey + " (archive " + archive + ") from " + CDNServers[i]);
+                        continue;
+                    }
                 }
 
                 return File.ReadAllBytes(cachePath);
@@ -641,12 +672,13 @@ namespace TACTSharp
                 if (Settings.LogLevel <= TSLogLevel.Info)
                     Console.WriteLine("Downloading " + url);
 
-                var request = new HttpRequestMessage(HttpMethod.Get, url);
+                using var request = new HttpRequestMessage(HttpMethod.Get, url);
 
                 if (Settings.ForceHTTP1)
                     request.Version = new Version(1, 1);
 
-                var response = Client.Send(request, token);
+                using var networkScope = Settings.NetworkRequestScope?.Invoke(token);
+                using var response = Client.Send(request, token);
 
                 if (!response.IsSuccessStatusCode)
                 {
@@ -664,6 +696,11 @@ namespace TACTSharp
                     {
                         using (var fileStream = new FileStream(cachePath, FileMode.Create, FileAccess.Write))
                             response.Content.ReadAsStream(token).CopyTo(fileStream);
+                    }
+                    catch (OperationCanceledException) when (token.IsCancellationRequested)
+                    {
+                        File.Delete(cachePath);
+                        throw;
                     }
                     catch (Exception e)
                     {
